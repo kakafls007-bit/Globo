@@ -91,3 +91,9 @@ main{margin-left:246px}.topbar{height:70px;border-bottom:1px solid var(--line);d
 .prompter:fullscreen .reading-window{height:auto;flex:1}
 .next-title{flex:1 0 auto;max-width:42%}
 .next-hint{min-width:60px;overflow:hidden;text-overflow:ellipsis}
+
+/* Texto não falado (título, tom, dica) acompanha o tamanho da fonte (RF07) */
+.reading-text .script-cue{font-size:max(13px,.5em);letter-spacing:.08em;margin-bottom:.4em}
+.reading-text .script-hint{font-size:max(13px,.55em);letter-spacing:.03em;margin:0 0 1em}
+.reading-text .end-cue{font-size:max(12px,.42em)}
+.reading-text .next-divider{font-size:max(12px,.42em)}
