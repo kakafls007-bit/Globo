@@ -1,10 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from "react"
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type CSSProperties,
+} from "react"
 import Icon from "./Icon"
 import {
   architectureLayers,
   initialScripts,
   requirements,
+  TONES,
+  toneOrder,
   type Script,
+  type Tone,
 } from "./data"
 
 type Page = "console" | "scripts" | "requirements" | "architecture"
@@ -39,12 +49,98 @@ function loadScripts(): Script[] {
           ),
       )
     )
-      return parsed
+      return (parsed as Script[]).map(normalizeScript)
   } catch {
     /* Unavailable storage must not prevent manual operation. */
   }
   return initialScripts
 }
+/** Roteiros salvos antes da existência do tom ganham um tom padrão pelo formato. */
+function normalizeScript(script: Script): Script {
+  return {
+    ...script,
+    blocks: script.blocks.map((b) => ({
+      ...b,
+      tone: toneOrder.includes(b.tone)
+        ? b.tone
+        : b.type === "PLANTÃO"
+          ? "urgente"
+          : b.type === "SERVIÇO"
+            ? "servico"
+            : "serio",
+    })),
+  }
+}
+
+type Contrast = "normal" | "branco" | "amarelo"
+type AlertMode = "completo" | "cor" | "off"
+type Prefs = {
+  speed: number
+  fontSize: number
+  lineSpacing: number
+  contrast: Contrast
+  guideOn: boolean
+  guidePos: number
+  alertMode: AlertMode
+  mirrorX: boolean
+  mirrorY: boolean
+}
+const prefsKey = "tp-autopilot-prefs-v1"
+const defaultPrefs: Prefs = {
+  speed: 32,
+  fontSize: 32,
+  lineSpacing: 1.55,
+  contrast: "normal",
+  guideOn: true,
+  guidePos: 40,
+  alertMode: "completo",
+  mirrorX: false,
+  mirrorY: false,
+}
+const clamp = (value: unknown, min: number, max: number, fallback: number) =>
+  typeof value === "number" && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value))
+    : fallback
+function loadPrefs(): Prefs {
+  try {
+    const p = JSON.parse(localStorage.getItem(prefsKey) || "null")
+    if (p && typeof p === "object")
+      return {
+        speed: clamp(p.speed, 10, 90, defaultPrefs.speed),
+        fontSize: clamp(p.fontSize, 24, 52, defaultPrefs.fontSize),
+        lineSpacing: clamp(p.lineSpacing, 1.2, 2.2, defaultPrefs.lineSpacing),
+        contrast: ["normal", "branco", "amarelo"].includes(p.contrast)
+          ? p.contrast
+          : "normal",
+        guideOn: p.guideOn !== false,
+        guidePos: clamp(p.guidePos, 20, 65, defaultPrefs.guidePos),
+        alertMode: ["completo", "cor", "off"].includes(p.alertMode)
+          ? p.alertMode
+          : "completo",
+        mirrorX: p.mirrorX === true,
+        mirrorY: p.mirrorY === true,
+      }
+  } catch {
+    /* Preferências indisponíveis: usa o padrão. */
+  }
+  return defaultPrefs
+}
+/** Antecedência (s) do pré-aviso e do aviso final de mudança de tom. */
+const WARN_SECONDS = 25
+const FINAL_SECONDS = 8
+/** Diferença mínima de "peso emocional" para considerar mudança relevante de tom. */
+const TONE_JUMP = 2
+
+function ToneChip({ tone }: { tone: Tone }) {
+  const t = TONES[tone]
+  return (
+    <span className="tone-chip" style={{ "--tone": t.color } as CSSProperties}>
+      <span aria-hidden="true">{t.icon}</span>
+      {t.label}
+    </span>
+  )
+}
+
 function timeLabel(seconds: number) {
   return `${Math.floor(seconds / 60)
     .toString()
@@ -59,10 +155,17 @@ export default function App() {
   const [scriptId, setScriptId] = useState(scripts[0].id)
   const [blockIndex, setBlockIndex] = useState(0)
   const [running, setRunning] = useState(false)
-  const [speed, setSpeed] = useState(32)
-  const [fontSize, setFontSize] = useState(32)
-  const [mirrorX, setMirrorX] = useState(false)
-  const [mirrorY, setMirrorY] = useState(false)
+  const [initialPrefs] = useState(loadPrefs)
+  const [speed, setSpeed] = useState(initialPrefs.speed)
+  const [fontSize, setFontSize] = useState(initialPrefs.fontSize)
+  const [lineSpacing, setLineSpacing] = useState(initialPrefs.lineSpacing)
+  const [contrast, setContrast] = useState<Contrast>(initialPrefs.contrast)
+  const [guideOn, setGuideOn] = useState(initialPrefs.guideOn)
+  const [guidePos, setGuidePos] = useState(initialPrefs.guidePos)
+  const [alertMode, setAlertMode] = useState<AlertMode>(initialPrefs.alertMode)
+  const [mirrorX, setMirrorX] = useState(initialPrefs.mirrorX)
+  const [mirrorY, setMirrorY] = useState(initialPrefs.mirrorY)
+  const [remaining, setRemaining] = useState<number | null>(null)
   const [presenter, setPresenter] = useState(false)
   const [editor, setEditor] = useState<Script | null>(null)
   const [deleteId, setDeleteId] = useState<string | null>(null)
@@ -77,6 +180,10 @@ export default function App() {
   const player = useRef<HTMLElement>(null)
   const frame = useRef(0)
   const scrollPosition = useRef(0)
+  const readingText = useRef<HTMLDivElement>(null)
+  const endSpacer = useRef<HTMLDivElement>(null)
+  /** Âncora lógica da leitura: fração do texto que está sob o marcador. */
+  const anchorFrac = useRef<number | null>(null)
   const script = scripts.find((s) => s.id === scriptId) || scripts[0]
   const block = script.blocks[Math.min(blockIndex, script.blocks.length - 1)]
   const words = script.blocks.reduce(
@@ -84,6 +191,49 @@ export default function App() {
     0,
   )
   const notify = useCallback((message: string) => setToast(message), [])
+  const tone = TONES[block.tone]
+  const nextBlock = script.blocks[blockIndex + 1]
+  const nextTone = nextBlock ? TONES[nextBlock.tone] : null
+  const toneJump =
+    nextTone !== null && Math.abs(nextTone.weight - tone.weight) >= TONE_JUMP
+  const secondsLeft = remaining ?? Infinity
+  const alertStage: "idle" | "warn" | "final" =
+    alertMode === "off" || !toneJump
+      ? "idle"
+      : secondsLeft <= FINAL_SECONDS
+        ? "final"
+        : secondsLeft <= WARN_SECONDS
+          ? "warn"
+          : "idle"
+
+  /** Calcula onde está o marcador dentro do texto (independe de fonte e espaçamento). */
+  const updateAnchor = useCallback(() => {
+    const el = viewport.current
+    const rt = readingText.current
+    if (!el || !rt || !rt.offsetHeight) return
+    const contentTop =
+      rt.getBoundingClientRect().top -
+      el.getBoundingClientRect().top +
+      el.scrollTop
+    const guideY = (el.clientHeight * guidePos) / 100
+    anchorFrac.current = (el.scrollTop + guideY - contentTop) / rt.offsetHeight
+  }, [guidePos])
+  /** Reposiciona a rolagem para manter a mesma palavra sob o marcador. */
+  const restoreAnchor = useCallback(() => {
+    const el = viewport.current
+    const rt = readingText.current
+    if (!el || !rt || anchorFrac.current === null) return
+    const contentTop =
+      rt.getBoundingClientRect().top -
+      el.getBoundingClientRect().top +
+      el.scrollTop
+    const guideY = (el.clientHeight * guidePos) / 100
+    el.scrollTop = Math.max(
+      0,
+      contentTop + anchorFrac.current * rt.offsetHeight - guideY,
+    )
+    scrollPosition.current = el.scrollTop
+  }, [guidePos])
 
   useEffect(() => {
     try {
@@ -94,6 +244,66 @@ export default function App() {
     }
   }, [scripts])
   useEffect(() => {
+    try {
+      localStorage.setItem(
+        prefsKey,
+        JSON.stringify({
+          speed,
+          fontSize,
+          lineSpacing,
+          contrast,
+          guideOn,
+          guidePos,
+          alertMode,
+          mirrorX,
+          mirrorY,
+        } satisfies Prefs),
+      )
+    } catch {
+      /* Preferências não salvas: a operação continua normalmente. */
+    }
+  }, [
+    speed,
+    fontSize,
+    lineSpacing,
+    contrast,
+    guideOn,
+    guidePos,
+    alertMode,
+    mirrorX,
+    mirrorY,
+  ])
+  // RF07: fonte, espaçamento e posição do marcador mudam o layout do texto.
+  // A rolagem NÃO é pausada: a posição é recalculada pela âncora lógica.
+  useLayoutEffect(() => {
+    restoreAnchor()
+    updateAnchor()
+  }, [fontSize, lineSpacing, guidePos, presenter, restoreAnchor, updateAnchor])
+  // RF03: estima quanto falta para o fim do bloco (rolagem + velocidade).
+  useEffect(() => {
+    const compute = () => {
+      const el = viewport.current
+      const tail = endSpacer.current
+      if (!el || !tail) return
+      const textEnd = el.scrollHeight - tail.offsetHeight
+      const guideY = (el.clientHeight * guidePos) / 100
+      const distance = textEnd - (el.scrollTop + guideY)
+      setRemaining(Math.max(0, Math.round(distance / Math.max(speed, 1))))
+    }
+    compute()
+    const id = window.setInterval(compute, 250)
+    return () => window.clearInterval(id)
+  }, [
+    speed,
+    guidePos,
+    fontSize,
+    lineSpacing,
+    scriptId,
+    blockIndex,
+    presenter,
+    page,
+  ])
+  useEffect(() => {
     if (!toast) return
     const timeout = window.setTimeout(() => setToast(""), 4500)
     return () => window.clearTimeout(timeout)
@@ -102,6 +312,7 @@ export default function App() {
     setRunning(false)
     setElapsed(0)
     scrollPosition.current = 0
+    anchorFrac.current = null
     if (viewport.current) viewport.current.scrollTop = 0
   }, [scriptId, blockIndex])
   useEffect(() => {
@@ -155,31 +366,48 @@ export default function App() {
         editor ||
         settings ||
         deleteId ||
-        (page !== "console" && !presenter) ||
-        (event.target instanceof HTMLElement &&
-          event.target.closest("input,textarea,select,button"))
+        (page !== "console" && !presenter)
       )
         return
-      if (event.code === "Space") {
+      const target =
+        event.target instanceof HTMLElement ? event.target : null
+      // Digitando em campos: nenhum atalho. Foco em botão: só os atalhos
+      // novos (C, G, + e −), que não têm função nativa no botão.
+      if (target?.closest("input,textarea,select")) return
+      const basic = !target?.closest("button")
+      if (basic && event.code === "Space") {
         event.preventDefault()
         setRunning((v) => !v)
       }
-      if (event.key === "ArrowDown" || event.key === "ArrowUp") {
+      if (basic && (event.key === "ArrowDown" || event.key === "ArrowUp")) {
         event.preventDefault()
         manualScroll(event.key === "ArrowDown" ? 65 : -65)
       }
-      if (event.key === "ArrowRight") {
+      if (basic && event.key === "ArrowRight") {
         event.preventDefault()
         selectBlock(blockIndex + 1)
       }
-      if (event.key === "ArrowLeft") {
+      if (basic && event.key === "ArrowLeft") {
         event.preventDefault()
         selectBlock(blockIndex - 1)
       }
-      if (event.key === "Escape") {
+      if (basic && event.key === "Escape") {
         setPresenter(false)
         setRunning(false)
       }
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      // RF07: zoom sem pausar a rolagem
+      if (event.key === "+" || event.key === "=")
+        setFontSize((v) => Math.min(52, v + 2))
+      if (event.key === "-" || event.key === "_")
+        setFontSize((v) => Math.max(24, v - 2))
+      // RF08: alto contraste
+      if (event.key.toLowerCase() === "c")
+        setContrast((v) =>
+          v === "normal" ? "branco" : v === "branco" ? "amarelo" : "normal",
+        )
+      // RF09: marcador visual
+      if (event.key.toLowerCase() === "g") setGuideOn((v) => !v)
     }
     window.addEventListener("keydown", handler)
     return () => window.removeEventListener("keydown", handler)
@@ -234,6 +462,7 @@ export default function App() {
   const changePage = (next: Page) => {
     setRunning(false)
     scrollPosition.current = 0
+    anchorFrac.current = null
     setElapsed(0)
     setPage(next)
   }
@@ -257,12 +486,13 @@ export default function App() {
           id: crypto.randomUUID(),
           title: "Abertura",
           type: "CABEÇA",
+          tone: "serio",
           text: "",
         },
       ],
     })
   const exportScript = () => {
-    const text = `${script.title}\nApresentador: ${script.presenter}\n\n${script.blocks.map((b) => `[${b.type}] ${b.title}\n\n${b.text}`).join("\n\n---\n\n")}`
+    const text = `${script.title}\nApresentador: ${script.presenter}\n\n${script.blocks.map((b) => `[${b.type} · ${TONES[b.tone].label}] ${b.title}\n\n${b.text}`).join("\n\n---\n\n")}`
     const url = URL.createObjectURL(
       new Blob([text], { type: "text/plain;charset=utf-8" }),
     )
@@ -285,11 +515,18 @@ export default function App() {
     setRunning(false)
     setElapsed(0)
     scrollPosition.current = 0
+    anchorFrac.current = null
     if (viewport.current) viewport.current.scrollTop = 0
   }
+  const hint = block.toneHint?.trim() || tone.hint
+  const nextHint = nextBlock?.toneHint?.trim() || nextTone?.hint || ""
+  const eta = remaining === null ? "--:--" : timeLabel(remaining)
   const teleprompter = (
     <section
-      className={`prompter ${presenter ? "presenter-prompter" : ""}`}
+      className={`prompter ${presenter ? "presenter-prompter" : ""} contrast-${contrast} ${
+        contrast !== "normal" ? "hc" : ""
+      }`}
+      style={{ "--tone": tone.color } as CSSProperties}
       ref={player}
       aria-label="Teleprompter"
     >
@@ -299,6 +536,7 @@ export default function App() {
           {running ? "ROLAGEM EM CURSO" : "PRONTO PARA LEITURA"}
         </span>
         <span>
+          <ToneChip tone={block.tone} />
           {block.type} <i /> BLOCO {String(blockIndex + 1).padStart(2, "0")} /{" "}
           {String(script.blocks.length).padStart(2, "0")}
         </span>
@@ -307,26 +545,43 @@ export default function App() {
         </button>
       </div>
       <div className="reading-window" onWheel={() => setRunning(false)}>
-        <div className="reading-guide">
-          <span />
-        </div>
+        <div className="tone-stripe" aria-hidden="true" />
+        {guideOn && (
+          <div
+            className="reading-guide-line"
+            style={{ top: `${guidePos}%` }}
+            aria-hidden="true"
+          >
+            <span className="g-arrow left" />
+            <span className="g-line" />
+            <span className="g-arrow right" />
+          </div>
+        )}
         <div
           className="script-scroll"
           ref={viewport}
           onScroll={(e) => {
             if (!running) scrollPosition.current = e.currentTarget.scrollTop
+            updateAnchor()
           }}
         >
+          <div style={{ height: `${guidePos}%` }} aria-hidden="true" />
           <div
             className={`reading-text ${mirrorX ? "mirror-x" : ""} ${
               mirrorY ? "mirror-y" : ""
             }`}
+            ref={readingText}
             style={{
               fontSize,
+              lineHeight: lineSpacing,
+              paddingBottom: 0,
               transform: `scale(${mirrorX ? -1 : 1}, ${mirrorY ? -1 : 1})`,
             }}
           >
-            <span className="script-cue">{block.title.toUpperCase()}</span>
+            <span className="script-cue">
+              {block.title.toUpperCase()} · {tone.label}
+            </span>
+            <span className="script-hint">{hint}</span>
             {block.text
               .split(/\n+/)
               .filter(Boolean)
@@ -341,9 +596,69 @@ export default function App() {
             <div className="end-cue">
               FIM DO BLOCO <span>◇</span>
             </div>
+            {nextBlock && nextTone && (
+              <div className="next-divider" aria-hidden="true">
+                <span />
+                {nextBlock.title.toUpperCase()} · {nextTone.label}
+                <span />
+              </div>
+            )}
           </div>
+          <div
+            ref={endSpacer}
+            style={{ height: `${100 - guidePos}%` }}
+            aria-hidden="true"
+          />
         </div>
         <div className="reading-vignette" />
+      </div>
+      <div
+        className={`next-bar stage-${alertStage} ${
+          alertMode === "cor" ? "color-only" : ""
+        }`}
+        style={
+          { "--next-tone": nextTone?.color ?? "#6c7f62" } as CSSProperties
+        }
+      >
+        {!nextBlock || !nextTone ? (
+          <>
+            <span className="next-label">A SEGUIR ›</span>
+            <strong className="next-title">FIM DA EDIÇÃO</strong>
+            <span className="next-eta">fim em ~{eta}</span>
+          </>
+        ) : alertStage === "idle" || alertMode === "cor" ? (
+          <>
+            <span className="next-label">A SEGUIR ›</span>
+            <strong className="next-title">{nextBlock.title}</strong>
+            <ToneChip tone={nextBlock.tone} />
+            <span className="next-eta">em ~{eta}</span>
+          </>
+        ) : (
+          <>
+            <span className="next-alert" role="status">
+              ⚠ MUDANÇA DE TOM{" "}
+              <b>
+                {tone.label} → {nextTone.label}
+              </b>
+            </span>
+            <strong className="next-title">{nextBlock.title}</strong>
+            {alertStage === "final" ? (
+              <span className="next-hint">{nextHint}</span>
+            ) : (
+              <span className="next-progress" aria-hidden="true">
+                <i
+                  style={{
+                    width: `${Math.round(
+                      Math.min(1, Math.max(0, 1 - secondsLeft / WARN_SECONDS)) *
+                        100,
+                    )}%`,
+                  }}
+                />
+              </span>
+            )}
+            <span className="next-eta">em ~{eta}</span>
+          </>
+        )}
       </div>
       <div className="prompter-bottom">
         <span>
@@ -383,7 +698,10 @@ export default function App() {
               <Icon name={running ? "pause" : "play"} size={16} />
               {running ? "Pausar" : "Iniciar leitura"}
             </button>
-            <span>Espaço: pausar · ↑ ↓: ajuste manual · ← →: trocar bloco</span>
+            <span>
+              Espaço: pausar · ↑ ↓: ajuste manual · ← →: trocar bloco · + −:
+              texto · C: contraste · G: marcador
+            </span>
           </div>
         </>
       ) : (
@@ -653,7 +971,16 @@ export default function App() {
                                 {b.type} <i />{" "}
                                 {timeLabel(
                                   Math.max(5, b.text.split(/\s+/).length / 2.5),
-                                )}
+                                )}{" "}
+                                <i />
+                                <span
+                                  className="tone-mini"
+                                  style={
+                                    { "--tone": TONES[b.tone].color } as CSSProperties
+                                  }
+                                >
+                                  {TONES[b.tone].icon} {TONES[b.tone].label}
+                                </span>
                               </span>
                             </div>
                             {index === blockIndex && (
@@ -770,10 +1097,100 @@ export default function App() {
                             V
                           </button>
                         </div>
+                      <div className="transport-display">
+                        <div className="font-buttons">
+                          <span>Espaço</span>
+                          <button
+                            aria-label="Diminuir espaçamento entre linhas"
+                            disabled={lineSpacing <= 1.2}
+                            onClick={() =>
+                              setLineSpacing((v) =>
+                                Math.max(1.2, Math.round((v - 0.1) * 100) / 100),
+                              )
+                            }
+                          >
+                            ↕−
+                          </button>
+                          <button
+                            aria-label="Aumentar espaçamento entre linhas"
+                            disabled={lineSpacing >= 2.2}
+                            onClick={() =>
+                              setLineSpacing((v) =>
+                                Math.min(2.2, Math.round((v + 0.1) * 100) / 100),
+                              )
+                            }
+                          >
+                            ↕+
+                          </button>
+                        </div>
+                        <div className="display-group">
+                          <span>Contraste</span>
+                          <div className="seg" role="group" aria-label="Contraste">
+                            {(
+                              [
+                                ["normal", "Normal"],
+                                ["branco", "Branco"],
+                                ["amarelo", "Amarelo"],
+                              ] as const
+                            ).map(([value, label]) => (
+                              <button
+                                key={value}
+                                aria-pressed={contrast === value}
+                                onClick={() => setContrast(value)}
+                              >
+                                {label}
+                              </button>
+                            ))}
+                          </div>
+                        </div>
+                        <div className="display-group">
+                          <span>Marcador</span>
+                          <button
+                            className={`small-control ${guideOn ? "is-active" : ""}`}
+                            aria-pressed={guideOn}
+                            onClick={() => setGuideOn((v) => !v)}
+                          >
+                            {guideOn ? "Ligado" : "Desligado"}
+                          </button>
+                          <input
+                            type="range"
+                            min="20"
+                            max="65"
+                            aria-label="Posição do marcador"
+                            value={guidePos}
+                            disabled={!guideOn}
+                            onChange={(e) => setGuidePos(Number(e.target.value))}
+                          />
+                        </div>
+                        <div className="display-group">
+                          <span>Alertas de tom</span>
+                          <select
+                            aria-label="Alertas de tom"
+                            value={alertMode}
+                            onChange={(e) =>
+                              setAlertMode(e.target.value as AlertMode)
+                            }
+                          >
+                            <option value="completo">Completo</option>
+                            <option value="cor">Só cor</option>
+                            <option value="off">Desligado</option>
+                          </select>
+                        </div>
+                      </div>
                       </div>
                       <div className="keyboard-hint">
                         <span>
                           <kbd>Space</kbd> iniciar / pausar
+                        </span>
+                        <span>
+                          <kbd>+</kbd>
+                          <kbd>−</kbd> texto
+                        </span>
+                        <span>
+                          <kbd>C</kbd> contraste
+                        </span>
+                        <span>
+                          <kbd>G</kbd> marcador
                         </span>
                         <span>
                           <kbd>↑</kbd>
@@ -882,9 +1299,10 @@ export default function App() {
                   <div className="honesty-note">
                     <Icon name="architecture" size={15} />
                     <p>
-                      <strong>Protótipo funcional.</strong> Rolagem, edição e
-                      espelhamento disponíveis. STT local, pedal físico,
-                      redundância e saídas independentes ainda não
+                      <strong>Protótipo funcional.</strong> Rolagem, edição,
+                      tons e alertas de transição, zoom, alto contraste,
+                      marcador e espelhamento disponíveis. STT local, pedal
+                      físico, redundância e saídas independentes ainda não
                       implementados.
                     </p>
                     <span>TRANSPARÊNCIA POR PROJETO</span>
@@ -1011,7 +1429,7 @@ export default function App() {
                         industrial.
                       </p>
                     </div>
-                    <span className="badge neutral">RF01–RF10</span>
+                    <span className="badge neutral">RF01–RF14</span>
                   </div>
                   <section className="panel requirements-panel">
                     <div className="requirements-head">
@@ -1428,6 +1846,48 @@ export default function App() {
                         </select>
                       </label>
                     </div>
+                    <div className="form-grid">
+                      <label>
+                        Tom emocional
+                        <select
+                          value={b.tone}
+                          onChange={(e) =>
+                            setEditor({
+                              ...editor,
+                              blocks: editor.blocks.map((v) =>
+                                v.id === b.id
+                                  ? { ...v, tone: e.target.value as Tone }
+                                  : v,
+                              ),
+                            })
+                          }
+                        >
+                          {toneOrder.map((t) => (
+                            <option key={t} value={t}>
+                              {TONES[t].icon} {TONES[t].label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+                      <label>
+                        Dica de interpretação (opcional)
+                        <input
+                          maxLength={60}
+                          value={b.toneHint ?? ""}
+                          placeholder={TONES[b.tone].hint}
+                          onChange={(e) =>
+                            setEditor({
+                              ...editor,
+                              blocks: editor.blocks.map((v) =>
+                                v.id === b.id
+                                  ? { ...v, toneHint: e.target.value }
+                                  : v,
+                              ),
+                            })
+                          }
+                        />
+                      </label>
+                    </div>
                     <label>
                       Texto para leitura
                       <textarea
@@ -1461,6 +1921,7 @@ export default function App() {
                           id: crypto.randomUUID(),
                           title: `Bloco ${editor.blocks.length + 1}`,
                           type: "CABEÇA",
+                          tone: "serio",
                           text: "",
                         },
                       ],
@@ -1530,6 +1991,58 @@ export default function App() {
                   onChange={(e) => setSpeed(Number(e.target.value))}
                 />
               </label>
+              <label>
+                Espaçamento entre linhas <strong>{lineSpacing.toFixed(2)}</strong>
+                <input
+                  type="range"
+                  min="1.2"
+                  max="2.2"
+                  step="0.05"
+                  value={lineSpacing}
+                  onChange={(e) => setLineSpacing(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Contraste
+                <select
+                  value={contrast}
+                  onChange={(e) => setContrast(e.target.value as Contrast)}
+                >
+                  <option value="normal">Normal</option>
+                  <option value="branco">Alto contraste · texto branco</option>
+                  <option value="amarelo">Alto contraste · texto amarelo</option>
+                </select>
+              </label>
+              <label className="checkbox-label">
+                <input
+                  type="checkbox"
+                  checked={guideOn}
+                  onChange={(e) => setGuideOn(e.target.checked)}
+                />
+                Marcador visual (linha de guia)
+              </label>
+              <label>
+                Posição do marcador <strong>{guidePos}%</strong>
+                <input
+                  type="range"
+                  min="20"
+                  max="65"
+                  value={guidePos}
+                  disabled={!guideOn}
+                  onChange={(e) => setGuidePos(Number(e.target.value))}
+                />
+              </label>
+              <label>
+                Alertas de mudança de tom
+                <select
+                  value={alertMode}
+                  onChange={(e) => setAlertMode(e.target.value as AlertMode)}
+                >
+                  <option value="completo">Completo (aviso e dica)</option>
+                  <option value="cor">Só cor</option>
+                  <option value="off">Desligado</option>
+                </select>
+              </label>
               <label className="checkbox-label">
                 <input
                   type="checkbox"
@@ -1555,8 +2068,13 @@ export default function App() {
               <button
                 className="button"
                 onClick={() => {
-                  setFontSize(32)
-                  setSpeed(32)
+                  setFontSize(defaultPrefs.fontSize)
+                  setSpeed(defaultPrefs.speed)
+                  setLineSpacing(defaultPrefs.lineSpacing)
+                  setContrast(defaultPrefs.contrast)
+                  setGuideOn(defaultPrefs.guideOn)
+                  setGuidePos(defaultPrefs.guidePos)
+                  setAlertMode(defaultPrefs.alertMode)
                   setMirrorX(false)
                   setMirrorY(false)
                 }}
